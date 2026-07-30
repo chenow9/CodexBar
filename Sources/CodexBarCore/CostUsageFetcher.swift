@@ -296,7 +296,7 @@ public struct CostUsageFetcher: Sendable {
                 }
                 let bundle = try GrokTurnUsageScanner.loadScanBundle(
                     since: since,
-                    until: until,
+                    until: now,
                     now: now,
                     options: grokOptions,
                     checkCancellation: checkCancellation)
