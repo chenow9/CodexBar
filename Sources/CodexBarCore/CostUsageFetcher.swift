@@ -288,89 +288,17 @@ public struct CostUsageFetcher: Sendable {
         // scanner-level checks.
         let scanOptions = options
         let scanResult = try await CostUsageScanExecutor.run { checkCancellation in
-            // Grok: single-pass local session scan (daily + projects + sessions).
-            if provider == .grok {
-                var grokOptions = GrokTurnUsageScanner.Options()
-                if let override = scanOptions.grokSessionsRoot {
-                    grokOptions.sessionsRoot = override
-                }
-                let bundle = try GrokTurnUsageScanner.loadScanBundle(
-                    since: since,
-                    until: now,
-                    now: now,
-                    options: grokOptions,
-                    checkCancellation: checkCancellation)
-                return (daily: bundle.daily, projects: bundle.projects, sessions: bundle.sessions)
-            }
-
-            var daily = try CostUsageScanner.loadDailyReportCancellable(
+            try Self.scanLocalTokenUsage(
                 provider: provider,
                 since: since,
                 until: now,
                 now: now,
-                options: scanOptions,
+                scanOptions: scanOptions,
+                piOptions: piOptions,
+                allowVertexClaudeFallback: allowVertexClaudeFallback,
+                includePiSessions: includePiSessions,
+                shouldMergePiUsage: shouldMergePiUsage,
                 checkCancellation: checkCancellation)
-            try checkCancellation()
-
-            if provider == .vertexai,
-               !allowVertexClaudeFallback,
-               scanOptions.claudeLogProviderFilter == .vertexAIOnly,
-               daily.data.isEmpty
-            {
-                var fallback = scanOptions
-                fallback.claudeLogProviderFilter = .all
-                daily = try CostUsageScanner.loadDailyReportCancellable(
-                    provider: provider,
-                    since: since,
-                    until: now,
-                    now: now,
-                    options: fallback,
-                    checkCancellation: checkCancellation)
-                try checkCancellation()
-            }
-
-            var projects: [CostUsageProjectBreakdown] = []
-            var sessions: [CostUsageSessionBreakdown] = []
-            var piDaily: CostUsageDailyReport?
-            if provider == .codex {
-                let roots = CostUsageScanner.codexSessionsRoots(options: scanOptions)
-                let cache = CostUsageScanner.codexCache(
-                    CostUsageCacheIO.load(provider: .codex, cacheRoot: scanOptions.cacheRoot),
-                    scopedTo: roots)
-                let range = CostUsageScanner.CostUsageDayRange(
-                    since: since, until: now, calendar: scanOptions.calendar)
-                projects = CostUsageScanner.buildCodexProjectBreakdownsFromCache(
-                    cache: cache,
-                    range: range,
-                    modelsDevCacheRoot: scanOptions.cacheRoot)
-                sessions = CostUsageScanner.buildCodexSessionBreakdownsFromCache(
-                    cache: cache,
-                    range: range,
-                    modelsDevCacheRoot: scanOptions.cacheRoot,
-                    sessionRoots: roots)
-            }
-            if includePiSessions, provider == .claude || (provider == .codex && shouldMergePiUsage) {
-                let piReport = try PiSessionCostScanner.loadDailyReportCancellable(
-                    provider: provider,
-                    since: since,
-                    until: now,
-                    now: now,
-                    options: piOptions,
-                    checkCancellation: checkCancellation)
-                try checkCancellation()
-                if provider == .codex {
-                    piDaily = piReport
-                }
-                daily = CostUsageDailyReport.merged([daily, piReport])
-            }
-            if provider == .codex {
-                projects = Self.mergedProjectBreakdowns(
-                    projects + [piDaily.flatMap(Self.unknownProjectBreakdown(from:))].compactMap(\.self))
-                if piDaily?.data.isEmpty == false {
-                    sessions = []
-                }
-            }
-            return (daily: daily, projects: projects, sessions: sessions)
         }
 
         if allowPricingRefresh,
@@ -415,6 +343,109 @@ public struct CostUsageFetcher: Sendable {
         let isAllowed: Bool
         let retryUnknown: Bool
         let inBackground: Bool
+    }
+
+    private typealias LocalTokenScanResult = (
+        daily: CostUsageDailyReport,
+        projects: [CostUsageProjectBreakdown],
+        sessions: [CostUsageSessionBreakdown])
+
+    /// Local session/log scan used by `loadTokenSnapshot` (Grok dedicated path + shared scanners).
+    private static func scanLocalTokenUsage(
+        provider: UsageProvider,
+        since: Date,
+        until: Date,
+        now: Date,
+        scanOptions: CostUsageScanner.Options,
+        piOptions: PiSessionCostScanner.Options,
+        allowVertexClaudeFallback: Bool,
+        includePiSessions: Bool,
+        shouldMergePiUsage: Bool,
+        checkCancellation: () throws -> Void) throws -> LocalTokenScanResult
+    {
+        // Grok: single-pass local session scan (daily + projects + sessions).
+        if provider == .grok {
+            var grokOptions = GrokTurnUsageScanner.Options()
+            if let override = scanOptions.grokSessionsRoot {
+                grokOptions.sessionsRoot = override
+            }
+            let bundle = try GrokTurnUsageScanner.loadScanBundle(
+                since: since,
+                until: until,
+                now: now,
+                options: grokOptions,
+                checkCancellation: checkCancellation)
+            return (daily: bundle.daily, projects: bundle.projects, sessions: bundle.sessions)
+        }
+
+        var daily = try CostUsageScanner.loadDailyReportCancellable(
+            provider: provider,
+            since: since,
+            until: until,
+            now: now,
+            options: scanOptions,
+            checkCancellation: checkCancellation)
+        try checkCancellation()
+
+        if provider == .vertexai,
+           !allowVertexClaudeFallback,
+           scanOptions.claudeLogProviderFilter == .vertexAIOnly,
+           daily.data.isEmpty
+        {
+            var fallback = scanOptions
+            fallback.claudeLogProviderFilter = .all
+            daily = try CostUsageScanner.loadDailyReportCancellable(
+                provider: provider,
+                since: since,
+                until: until,
+                now: now,
+                options: fallback,
+                checkCancellation: checkCancellation)
+            try checkCancellation()
+        }
+
+        var projects: [CostUsageProjectBreakdown] = []
+        var sessions: [CostUsageSessionBreakdown] = []
+        var piDaily: CostUsageDailyReport?
+        if provider == .codex {
+            let roots = CostUsageScanner.codexSessionsRoots(options: scanOptions)
+            let cache = CostUsageScanner.codexCache(
+                CostUsageCacheIO.load(provider: .codex, cacheRoot: scanOptions.cacheRoot),
+                scopedTo: roots)
+            let range = CostUsageScanner.CostUsageDayRange(
+                since: since, until: until, calendar: scanOptions.calendar)
+            projects = CostUsageScanner.buildCodexProjectBreakdownsFromCache(
+                cache: cache,
+                range: range,
+                modelsDevCacheRoot: scanOptions.cacheRoot)
+            sessions = CostUsageScanner.buildCodexSessionBreakdownsFromCache(
+                cache: cache,
+                range: range,
+                modelsDevCacheRoot: scanOptions.cacheRoot,
+                sessionRoots: roots)
+        }
+        if includePiSessions, provider == .claude || (provider == .codex && shouldMergePiUsage) {
+            let piReport = try PiSessionCostScanner.loadDailyReportCancellable(
+                provider: provider,
+                since: since,
+                until: until,
+                now: now,
+                options: piOptions,
+                checkCancellation: checkCancellation)
+            try checkCancellation()
+            if provider == .codex {
+                piDaily = piReport
+            }
+            daily = CostUsageDailyReport.merged([daily, piReport])
+        }
+        if provider == .codex {
+            projects = Self.mergedProjectBreakdowns(
+                projects + [piDaily.flatMap(Self.unknownProjectBreakdown(from:))].compactMap(\.self))
+            if piDaily?.data.isEmpty == false {
+                sessions = []
+            }
+        }
+        return (daily: daily, projects: projects, sessions: sessions)
     }
 
     private static func refreshPricingIfAllowed(
